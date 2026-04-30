@@ -1,0 +1,26 @@
+{
+  "name": "linear-grid-game",
+  "version": "1.0.0",
+  "description": "Educational game for learning linear equations",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "nodemon server.js"
+  },
+  "keywords": [
+    "game",
+    "education",
+    "linear-equations"
+  ],
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "cors": "^2.8.6",
+    "express": "^4.18.2",
+    "socket.io": "^4.6.1",
+    "socket.io-client": "^4.8.3"
+  },
+  "devDependencies": {
+    "nodemon": "^3.0.1"
+  }
+}
