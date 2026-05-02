@@ -107,14 +107,13 @@ function generateRoomCode() {
     return Math.random().toString(36).substring(2, 8).toUpperCase();
 }
 
-function generateApplePositions(appleDensity) {
-    const gridSize = 10;
-    const totalPoints = (gridSize + 1) * (gridSize + 1);
+function generateApplePositions(appleDensity, gridSize = 10) {
+    const totalPoints = gridSize * gridSize;
     const appleCount = Math.floor(totalPoints * appleDensity);
     const posSet = new Set();
     while (posSet.size < appleCount) {
-        const x = Math.floor(Math.random() * (gridSize + 1));
-        const y = Math.floor(Math.random() * (gridSize + 1));
+        const x = Math.floor(Math.random() * gridSize);
+        const y = Math.floor(Math.random() * gridSize);
         posSet.add(`${x},${y}`);
     }
     return Array.from(posSet).map(pos => {
@@ -140,7 +139,9 @@ io.on('connection', (socket) => {
             creatorId: pId,
             config: {
                 appleDensity: config?.appleDensity || 0.25,
-                timePerTurn: config?.timePerTurn || 120
+                timePerTurn: config?.timePerTurn || 60,
+                mode: config?.mode || 'balanced',
+                gridSize: config?.gridSize || 10
             },
             status: 'waiting',
             players: [pId],
@@ -183,12 +184,17 @@ io.on('connection', (socket) => {
         const room = roomsDb.get(data.roomCode);
         const pId = data.playerId || socket.id;
         const playerName = data.name || 'Anonymous';
-        const joinerAvatarIndex = data.avatarIndex ?? 0;
-
         if (!room) { socket.emit('joinFailed', { message: 'Room not found' }); return; }
         if (room.players.length >= 2 && !room.players.includes(pId)) { socket.emit('joinFailed', { message: 'Room is full' }); return; }
 
-        playersDb.set(pId, { id: pId, name: playerName, avatarIndex: joinerAvatarIndex, lastActive: Date.now() });
+        let finalAvatarIndex = data.avatarIndex ?? 0;
+        const creatorId = room.creatorId;
+        const creator = playersDb.get(creatorId);
+        if (creator && creator.avatarIndex === finalAvatarIndex) {
+            finalAvatarIndex = (finalAvatarIndex + 1) % 8;
+        }
+
+        playersDb.set(pId, { id: pId, name: playerName, avatarIndex: finalAvatarIndex, lastActive: Date.now() });
 
         if (!room.players.includes(pId)) {
             room.players.push(pId);
@@ -207,9 +213,6 @@ io.on('connection', (socket) => {
 
         io.to(data.roomCode).emit('playerJoined', {
             players: fullPlayers,
-            joinerName: playerName,
-            joinerId: pId,
-            joinerAvatarIndex,
             config: room.config
         });
     });
@@ -230,7 +233,7 @@ io.on('connection', (socket) => {
             joinerPlayer.avatarIndex = (creatorPlayer.avatarIndex + 1) % 8;
         }
 
-        const applePositions = generateApplePositions(room.config.appleDensity);
+        const applePositions = generateApplePositions(room.config.appleDensity, room.config.gridSize);
 
         const sessionId = Math.random().toString(36).substring(2, 10);
         
@@ -256,6 +259,7 @@ io.on('connection', (socket) => {
             joinerName: joinerPlayer.name,
             appleDensity: room.config.appleDensity,
             timePerTurn: room.config.timePerTurn,
+            gridSize: room.config.gridSize,
             applePositions
         };
 
@@ -374,6 +378,7 @@ io.on('connection', (socket) => {
             joinerName: joinerPlayer.name,
             appleDensity: room.config.appleDensity,
             timePerTurn: room.config.timePerTurn,
+            gridSize: room.config.gridSize,
             applePositions: session.applePositions,
             eatenApples: eatenApplesArr,
             elapsedTime: Date.now() - session.startTime,
@@ -431,7 +436,13 @@ io.on('connection', (socket) => {
         const isCreator = pId === room.creatorId;
         const bothBack  = room.playersBack.size >= 2;
 
-        socket.broadcast.to(data.roomCode).emit('playerReturnedToRoom', { isCreator, bothBack });
+        // Include returning player's display info so the other side can refresh their waiting slots
+        const returningPlayer = playersDb.get(pId);
+        const playerInfo = returningPlayer
+            ? { name: returningPlayer.name, avatarIndex: returningPlayer.avatarIndex, isCreator }
+            : null;
+
+        socket.broadcast.to(data.roomCode).emit('playerReturnedToRoom', { isCreator, bothBack, player: playerInfo });
         socket.emit('returnedToRoomAck', { isCreator, bothBack });
     });
 
@@ -458,7 +469,7 @@ io.on('connection', (socket) => {
             }
             
             room.players = room.players.filter(id => id !== pId);
-            
+
             if (room.players.length === 0) {
                 if (room.status === 'waiting') {
                     roomsDb.delete(roomCode);
@@ -466,6 +477,19 @@ io.on('connection', (socket) => {
             } else {
                 room.status = 'waiting';
                 if (room.playersBack) room.playersBack.delete(pId);
+
+                // Host promotion: if creator left, promote remaining player to host
+                if (pId === room.creatorId && room.players.length > 0) {
+                    room.creatorId = room.players[0];
+                    io.to(roomCode).emit('hostPromoted', {
+                        newHostId: room.creatorId,
+                        players: room.players.map(pid => {
+                            const p = playersDb.get(pid);
+                            return { id: p.id, name: p.name, avatarIndex: p.avatarIndex };
+                        })
+                    });
+                    console.log(`[Host Promotion] Room ${roomCode}: ${pId} left, ${room.creatorId} promoted to host`);
+                }
             }
         }
         socket.leave(roomCode);
@@ -499,6 +523,19 @@ io.on('connection', (socket) => {
                     }
                 } else {
                     room.status = 'waiting';
+
+                    // Host promotion: if creator disconnected, promote remaining player to host
+                    if (pId === room.creatorId && room.players.length > 0) {
+                        room.creatorId = room.players[0];
+                        io.to(roomCode).emit('hostPromoted', {
+                            newHostId: room.creatorId,
+                            players: room.players.map(pid => {
+                                const p = playersDb.get(pid);
+                                return { id: p.id, name: p.name, avatarIndex: p.avatarIndex };
+                            })
+                        });
+                        console.log(`[Host Promotion] Room ${roomCode}: ${pId} disconnected, ${room.creatorId} promoted to host`);
+                    }
                 }
             }
         }
