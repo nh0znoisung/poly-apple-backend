@@ -107,6 +107,122 @@ function generateRoomCode() {
     return Math.random().toString(36).substring(2, 8).toUpperCase();
 }
 
+// ===== AUTHORITATIVE GAME-END LOGIC =====
+// Computes winner from session stats (used for timeout / apples_cleared).
+// Returns 1 (P2 loses, P1 wins), 2 (P1 wins, P2 loses), or null (draw).
+function computeLoserNum(session, creatorId, joinerId) {
+    const p1 = session.playerStats[creatorId] || { score: 0, expressionsUsed: 0 };
+    const p2 = (joinerId && session.playerStats[joinerId]) || { score: 0, expressionsUsed: 0 };
+
+    if (p1.score !== p2.score) return p1.score > p2.score ? 2 : 1;
+
+    let p1Apples = 0, p2Apples = 0;
+    for (const ownerId of session.eatenApples.values()) {
+        if (ownerId === creatorId) p1Apples++;
+        else if (ownerId === joinerId) p2Apples++;
+    }
+    if (p1Apples !== p2Apples) return p1Apples > p2Apples ? 2 : 1;
+    if (p1.expressionsUsed !== p2.expressionsUsed) return p1.expressionsUsed < p2.expressionsUsed ? 2 : 1;
+    return null;
+}
+
+function buildEndPayload(roomCode, reason, loserNum) {
+    const room = roomsDb.get(roomCode);
+    const session = sessionsDb.get(roomCode);
+    if (!room) return null;
+
+    const creatorId = room.creatorId;
+    const joinerId = room.players.find(id => id !== creatorId) || null;
+    const creator = playersDb.get(creatorId);
+    const joiner = joinerId ? playersDb.get(joinerId) : null;
+
+    const totalApples = session?.applePositions?.length || 0;
+    const eatenCount = session?.eatenApples?.size || 0;
+    const elapsedMs = session
+        ? (session.endTime || Date.now()) - session.startTime
+        : 0;
+
+    const histFor = (pid) => (session?.history || [])
+        .filter(h => h.playerId === pid)
+        .map(({ playerId, ...rest }) => rest);
+
+    const eatenFor = (pid) => {
+        const out = [];
+        if (!session) return out;
+        for (const [key, ownerId] of session.eatenApples) {
+            if (ownerId === pid) {
+                const [x, y] = key.split(',').map(Number);
+                out.push({ x, y });
+            }
+        }
+        return out;
+    };
+
+    const p1Stats = session?.playerStats[creatorId] || { score: 0, expressionsUsed: 0 };
+    const p2Stats = (joinerId && session?.playerStats[joinerId]) || { score: 0, expressionsUsed: 0 };
+
+    const eatenApplesAll = [];
+    if (session) {
+        for (const [key, ownerId] of session.eatenApples) {
+            const [x, y] = key.split(',').map(Number);
+            eatenApplesAll.push({ x, y, owner: ownerId === creatorId ? 1 : 2 });
+        }
+    }
+
+    return {
+        reason,
+        loserNum,
+        elapsedMs: Math.max(0, elapsedMs),
+        remainingApples: Math.max(0, totalApples - eatenCount),
+        applePositions: session?.applePositions || [],
+        eatenApples: eatenApplesAll,
+        gridSize: room.config.gridSize,
+        p1: {
+            name: creator?.name || 'Player 1',
+            avatarIndex: creator?.avatarIndex ?? 0,
+            score: p1Stats.score || 0,
+            expressionsUsed: p1Stats.expressionsUsed || 0,
+            eatenApples: eatenFor(creatorId),
+            history: histFor(creatorId),
+        },
+        p2: {
+            name: joiner?.name || 'Player 2',
+            avatarIndex: joiner?.avatarIndex ?? 0,
+            score: p2Stats.score || 0,
+            expressionsUsed: p2Stats.expressionsUsed || 0,
+            eatenApples: joinerId ? eatenFor(joinerId) : [],
+            history: joinerId ? histFor(joinerId) : [],
+        },
+    };
+}
+
+function finalizeGame(roomCode, reason, explicitLoserNum) {
+    const room = roomsDb.get(roomCode);
+    if (!room || room.status === 'ended') return;
+    const session = sessionsDb.get(roomCode);
+
+    let loserNum = explicitLoserNum;
+    if (loserNum == null) {
+        const creatorId = room.creatorId;
+        const joinerId = room.players.find(id => id !== creatorId) || null;
+        if (session) loserNum = computeLoserNum(session, creatorId, joinerId);
+    }
+
+    room.status = 'ended';
+    room.playersBack = new Set();
+    if (session) {
+        session.status = (reason === 'surrender' || reason === 'exit' || reason === 'disconnect') ? 'abandoned' : 'completed';
+        session.endTime = Date.now();
+    }
+
+    const payload = buildEndPayload(roomCode, reason, loserNum);
+    if (!payload) return;
+
+    io.to(roomCode).emit('gameEnd', payload);
+    const roomSpecs = spectators.get(roomCode);
+    if (roomSpecs) roomSpecs.forEach(s => io.to(s).emit('gameEnd', payload));
+}
+
 function generateApplePositions(appleDensity, gridSize = 10) {
     const totalPoints = gridSize * gridSize;
     const appleCount = Math.floor(totalPoints * appleDensity);
@@ -213,7 +329,8 @@ io.on('connection', (socket) => {
 
         io.to(data.roomCode).emit('playerJoined', {
             players: fullPlayers,
-            config: room.config
+            config: room.config,
+            creatorId: room.creatorId
         });
     });
 
@@ -396,23 +513,16 @@ io.on('connection', (socket) => {
     });
 
     socket.on('gameEnded', (data) => {
+        const reason = data.reason || 'timeout';
+        finalizeGame(data.roomCode, reason, null);
+    });
+
+    socket.on('surrender', (data) => {
         const room = roomsDb.get(data.roomCode);
-        const session = sessionsDb.get(data.roomCode);
-        if (room && room.status !== 'ended') {
-            room.status = 'ended';
-            room.playersBack = new Set();
-            if (session) {
-                session.status = 'completed';
-                session.endTime = Date.now();
-            }
-            
-            const reason = data.reason || 'timeout';
-            io.to(data.roomCode).emit('gameEndedServer', { reason });
-            const roomSpecs = spectators.get(data.roomCode);
-            if (roomSpecs) {
-                roomSpecs.forEach(specId => io.to(specId).emit('gameEndedServer', { reason }));
-            }
-        }
+        if (room?.status !== 'playing') return;
+        const pId = socket.data.playerId;
+        const loserNum = (room.creatorId === pId) ? 1 : 2;
+        finalizeGame(data.roomCode, 'surrender', loserNum);
     });
 
     socket.on('returnToRoom', (data) => {
@@ -450,24 +560,15 @@ io.on('connection', (socket) => {
         const roomCode = data.roomCode;
         if (!roomCode) return;
         const room = roomsDb.get(roomCode);
-        const session = sessionsDb.get(roomCode);
         if (room) {
             const pId = socket.data.playerId;
             if (room.status === 'playing') {
                 const loserNum = room.creatorId === pId ? 1 : 2;
                 const reason = data.reason || 'exit';
-                
-                io.to(roomCode).emit('gameEndedServer', { reason, loserNum });
-                const roomSpecs = spectators.get(roomCode);
-                if (roomSpecs) roomSpecs.forEach(s => io.to(s).emit('gameEndedServer', { reason, loserNum }));
-                
-                if (session) {
-                    session.status = 'abandoned';
-                    session.endTime = Date.now();
-                }
+                finalizeGame(roomCode, reason, loserNum);
                 socket.broadcast.to(roomCode).emit('opponentLeft');
             }
-            
+
             room.players = room.players.filter(id => id !== pId);
 
             if (room.players.length === 0) {
@@ -500,22 +601,14 @@ io.on('connection', (socket) => {
         const roomCode = socket.data.roomCode;
         if (roomCode) {
             const room = roomsDb.get(roomCode);
-            const session = sessionsDb.get(roomCode);
             if (room) {
                 const pId = socket.data.playerId;
                 if (room.status === 'playing') {
                     const loserNum = room.creatorId === pId ? 1 : 2;
-                    io.to(roomCode).emit('gameEndedServer', { reason: 'exit', loserNum });
-                    const roomSpecs = spectators.get(roomCode);
-                    if (roomSpecs) roomSpecs.forEach(s => io.to(s).emit('gameEndedServer', { reason: 'exit', loserNum }));
-                    
-                    if (session) {
-                        session.status = 'abandoned';
-                        session.endTime = Date.now();
-                    }
+                    finalizeGame(roomCode, 'disconnect', loserNum);
                     socket.broadcast.to(roomCode).emit('opponentDisconnected');
                 }
-                
+
                 room.players = room.players.filter(id => id !== pId);
                 if (room.players.length === 0) {
                     if (room.status === 'waiting') {
